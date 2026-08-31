@@ -49,7 +49,7 @@ def main() -> int:
     gateway.state.rail = FakeRail()
     gateway.state.monitor = ScriptedMonitor(verdict=Verdict.ALLOW)   # judgement is not the subject
     gateway.events.bus = events.EventBus(history=10_000)
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     # ---------------------------------------------------------------- mandate
     heading("1. THE HUMAN SIGNS ONE CEILING")

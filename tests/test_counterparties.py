@@ -80,7 +80,7 @@ def test_the_record_cannot_be_written_from_outside_the_gateway():
     source = inspect.getsource(gateway)
     # Exactly one place writes it, and it is behind a settled payment.
     assert source.count("state.counterparties.record(") == 1
-    assert "ledger_state = state.ledger.commit(reservation_id)" in source
+    assert "ledger_state = _commit(reservation_id)" in source
 
 
 # --- how it went, not just that it happened ---------------------------------

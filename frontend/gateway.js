@@ -108,8 +108,33 @@ export const agents = () => json('/agents')
 export const standing = () => json('/standing?include_pending=true')
 export const replay = (auditSeq) => post(`/replay/${auditSeq}`)
 
-export const decide = (id, approve) =>
-  post(`/approvals/${id}`, { decision: approve ? 'approve' : 'deny', by: 'console', note: '' })
+// The operator credential. Unlike the demo token it is never built into the
+// page: the person deciding pastes it once and this browser keeps it. Without
+// it the gateway refuses every decision, because the agent whose payment is
+// held must not be the one releasing it.
+const operatorToken = () => {
+  let token = localStorage.getItem('pc.operator') || ''
+  if (!token && typeof window !== 'undefined' && window.prompt) {
+    token = (window.prompt('Operator token (POCKETCHANGE_OPERATOR_TOKEN):') || '').trim()
+    if (token) localStorage.setItem('pc.operator', token)
+  }
+  return token
+}
+
+export const decide = async (id, approve) => {
+  const token = operatorToken()
+  try {
+    return await json(`/approvals/${id}`, {
+      method: 'POST',
+      headers: { ...writeHeaders(), ...(token ? { 'X-Operator-Token': token } : {}) },
+      body: JSON.stringify({ decision: approve ? 'approve' : 'deny', by: 'console', note: '' }),
+    })
+  } catch (error) {
+    // A stale or mistyped token is forgotten so the next click asks again.
+    if (error.status === 401) localStorage.removeItem('pc.operator')
+    throw error
+  }
+}
 
 // --- live ------------------------------------------------------------------
 //

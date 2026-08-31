@@ -309,6 +309,12 @@ class ToolSurface:
             record = sellers.get(seller_id).summary()
         except KeyError as exc:
             return {"error": str(exc)}
+        # The seller wrote its own name. find_offers marks it; this returned it
+        # bare, so the same text reached the model as data in one tool and as
+        # plain prose in the other.
+        self.untrusted_seen.add(record["name"])
+        record = provenance.mark_fields(record, ("name",))
+        record["name_untrusted"] = record.pop("name")
         self.attempts.append(Attempt("seller_reputation", {"seller_id": seller_id}, 200, record))
         return record
 

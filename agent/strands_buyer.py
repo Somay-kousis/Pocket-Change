@@ -70,6 +70,8 @@ def open_mandate(purpose: str, budget_rupees: int, *, gateway: str = GATEWAY) ->
             "purpose": purpose,
             "ttl_seconds": 3600,
         },
+        # The person's credential, which is what makes this the person's call.
+        headers={"X-Operator-Token": os.environ.get("POCKETCHANGE_OPERATOR_TOKEN", "")},
         timeout=TIMEOUT,
     )
     r.raise_for_status()

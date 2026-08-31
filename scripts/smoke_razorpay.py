@@ -16,7 +16,7 @@ from pocketchange import gateway  # noqa: E402
 from pocketchange.policy import RUPEE  # noqa: E402
 
 gateway.state = gateway.State()
-client = TestClient(gateway.app)
+client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
 health = client.get("/healthz").json()
 print(f"rail: {health['rail']}")

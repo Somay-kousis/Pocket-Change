@@ -11,6 +11,8 @@ Two guarantees of different kinds, and the tests say which is which:
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from agent.tools import ToolSurface
 from merchant import offers
 from pocketchange import gateway, token
@@ -26,7 +28,7 @@ def client(monkeypatch):
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     gateway.state = gateway.State()
     gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "pinned")
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 @pytest.fixture

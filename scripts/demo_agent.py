@@ -30,7 +30,7 @@ async def main() -> int:
     model = default_model()
 
     gateway.state = gateway.State()
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     mandate = client.post("/mandates", json={
         "budget_paise": 600_000 * RUPEE,

@@ -21,7 +21,7 @@ REQUEST = "Buy 4 kg of Sona Masoori rice and 2 kg of toor dal for the week."
 
 async def one(shape: str, model: str) -> dict:
     gateway.state = gateway.State()
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
     mandate = client.post("/mandates", json={
         "budget_paise": 600_000 * RUPEE, "purpose": "weekly groceries", "ttl_seconds": 3600,
     }).json()

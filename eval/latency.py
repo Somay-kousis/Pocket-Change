@@ -31,7 +31,7 @@ def measure(with_monitor: bool) -> dict:
     if not with_monitor:
         gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "monitor disabled")
 
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
     mandate = client.post("/mandates", json={
         "budget_paise": 100_000 * RUPEE, "purpose": "latency measurement",
         "ttl_seconds": 3600,

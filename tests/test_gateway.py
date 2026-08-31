@@ -8,6 +8,8 @@ testable without a payment account.
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from pocketchange import gateway
 from pocketchange.audit import Decision
 from pocketchange.policy import RUPEE
@@ -19,7 +21,7 @@ def client(monkeypatch):
     monkeypatch.delenv("RAZORPAY_KEY_ID", raising=False)
     monkeypatch.delenv("RAZORPAY_KEY_SECRET", raising=False)
     gateway.state = gateway.State()
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 @pytest.fixture
@@ -961,7 +963,7 @@ def test_a_defer_with_no_usable_amount_asks_a_person_instead_of_guessing(client,
     for useless in (None, 0, 900 * RUPEE, 5_000 * RUPEE):   # missing, zero, not smaller
         gateway.state.monitor = _defer_monitor(useless)
         r = client.post("/pay", headers={"X-AIP-Token": mandate["token"]}, json={
-            "amount_paise": 900 * RUPEE, "cart": {"STA-A4-5": 9, "n": useless or 0},
+            "amount_paise": 900 * RUPEE, "cart": {"STA-A4-5": 9, "n": repr(useless)},
             "context": "paper",
         })
         assert r.status_code == 202, f"{useless!r} should have escalated"

@@ -10,6 +10,7 @@ somewhere for the human to be.
   pocketchange approvals            what is waiting for a decision
   pocketchange approve <id> [note]  release a suspended payment
   pocketchange deny <id> [note]     refuse it and give the budget back
+                                    (both need POCKETCHANGE_OPERATOR_TOKEN set)
   pocketchange mandate <id>         what a mandate has spent
   pocketchange watch                the funnel, live, as it runs
   pocketchange audit                the trail, denials included
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 import httpx
@@ -31,6 +33,21 @@ RUPEE = 100
 
 def _client(url: str) -> httpx.Client:
     return httpx.Client(base_url=url, timeout=15.0)
+
+
+def _operator_headers() -> dict[str, str]:
+    """The operator credential, plus the demo token if this gateway gates writes.
+
+    Read from the environment, never a flag, so it does not land in shell history.
+    """
+    headers = {}
+    operator = os.environ.get("POCKETCHANGE_OPERATOR_TOKEN", "").strip()
+    if operator:
+        headers["X-Operator-Token"] = operator
+    demo = os.environ.get("POCKETCHANGE_DEMO_TOKEN", "").strip()
+    if demo:
+        headers["X-Demo-Token"] = demo
+    return headers
 
 
 def _rupees(paise: int | None) -> str:
@@ -72,6 +89,7 @@ def decide(url: str, approval_id: str, approve: bool, note: str) -> int:
                 f"/approvals/{approval_id}",
                 json={"decision": "approve" if approve else "deny",
                       "by": "cli", "note": note},
+                headers=_operator_headers(),
             )
     except httpx.HTTPError:
         return _unreachable(url)
@@ -79,6 +97,9 @@ def decide(url: str, approval_id: str, approve: bool, note: str) -> int:
     body = response.json()
     if response.status_code >= 400:
         print(f"  refused: {body.get('detail', body)}", file=sys.stderr)
+        if response.status_code in (401, 503) and "X-Operator-Token" not in _operator_headers():
+            print("  set POCKETCHANGE_OPERATOR_TOKEN to the gateway's operator token",
+                  file=sys.stderr)
         return 1
     if body["status"] == "approved":
         print(f"\n  approved. order {body['order_id']}, "

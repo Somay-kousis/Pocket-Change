@@ -40,7 +40,7 @@ async def main() -> int:
     # 15-per-minute model quota on a question this scenario is not asking.
     gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "pinned for stage 1")
 
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     mandate = client.post("/mandates", json={
         "budget_paise": 600_000 * RUPEE,

@@ -6,6 +6,8 @@ A failure here says which security property broke, not which function did.
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from agent.nodes import check_sub_mandate, inspect_cart
 from agent.tools import CartLine, ToolSurface
 from agent.utils import is_marked
@@ -23,7 +25,7 @@ BASKET = {"LAP-STD-1": 4, "MON-27Q-1": 2, "KVM-DCK-1": 1}
 def client():
     gateway.state = gateway.State()
     gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "pinned")
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 @pytest.fixture

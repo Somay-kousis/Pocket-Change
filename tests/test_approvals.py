@@ -9,6 +9,8 @@ from datetime import timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from pocketchange import gateway
 from pocketchange.approvals import ApprovalStore
 from pocketchange.monitor import ScriptedMonitor, Verdict
@@ -19,7 +21,7 @@ from pocketchange.policy import RUPEE
 def client():
     gateway.state = gateway.State()
     gateway.state.monitor = ScriptedMonitor(Verdict.ESCALATE, "40kg is not a household order")
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 @pytest.fixture

@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import contextvars
 import json
+import math
 import os
+import re
 import threading
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from hmac import compare_digest
@@ -33,18 +36,19 @@ from time import perf_counter
 from typing import Annotated, Any, Literal
 
 from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.requests import Request as _Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from . import config, counterparties, events, funnel as funnels, identity, intake, providers, token
 from . import memory as memory_bank
 from .approvals import AlreadyResolved, ApprovalStore, UnknownApproval
 from .audit import AuditLog, AuditTampered, Decision
-from .idempotency import ReplayStore, derive_key
-from .ledger import InsufficientBudget, LedgerError, UnknownMandate
+from .idempotency import MAX_MANDATE_LIFETIME, ReplayStore, canonical, derive_key
+from .ledger import InsufficientBudget, LedgerError, UnknownMandate, UnknownReservation
 from .ledger import from_env as ledger_from_env
 from .monitor import Judgement, Situation, Verdict
 from .monitor import from_env as monitor_from_env
@@ -71,7 +75,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-AIP-Token", "Authorization"],
+    allow_headers=["Content-Type", "X-AIP-Token", "Authorization", "X-Operator-Token"],
 )
 
 
@@ -207,21 +211,28 @@ def bearer_token(request: Request) -> str:
     parameters, because this is called directly from the handler rather than
     through Depends - declared parameters would silently arrive as None.
     """
+    found = None
     mcp = request.headers.get("x-aip-token")
     if mcp and mcp.strip():
-        return mcp.strip()
+        found = mcp.strip()
 
     authorization = request.headers.get("authorization")
-    if authorization and authorization.startswith("AIP "):
+    if found is None and authorization and authorization.startswith("AIP "):
         candidate = authorization[4:].strip()
         if candidate:
-            return candidate
+            found = candidate
 
     a2a = getattr(request.state, "a2a_token", None)
-    if a2a:
-        return a2a
+    if found is None and a2a:
+        found = a2a
 
-    raise HTTPException(401, "no AIP token: use X-AIP-Token, Authorization: AIP, or aip_token")
+    if found is None:
+        raise HTTPException(401, "no AIP token: use X-AIP-Token, Authorization: AIP, or aip_token")
+    # A depth-8 chain is about 3KB. Anything far past that is not a token this
+    # gateway minted, and parsing it is work an unauthenticated caller chose.
+    if len(found) > MAX_TOKEN_CHARS:
+        raise HTTPException(401, f"token longer than {MAX_TOKEN_CHARS} characters")
+    return found
 
 
 # --- the demo gate -----------------------------------------------------------
@@ -264,13 +275,104 @@ async def gate_writes(request: Request, call_next):
     """
     if DEMO_TOKEN and request.method not in ("GET", "HEAD", "OPTIONS"):
         offered = (request.headers.get("x-demo-token") or "").strip()
-        if not compare_digest(offered, DEMO_TOKEN):
+        # Bytes, not str: compare_digest raises TypeError on a non-ASCII str,
+        # so one accented character in the header was a 500 instead of a 401.
+        if not compare_digest(offered.encode(), DEMO_TOKEN.encode()):
             return JSONResponse(status_code=401, content={"detail": {
                 "denied": "this deployment gates writes behind a demo token",
                 "hint": "send X-Demo-Token. Reads are open - try GET /audit "
                         "or GET /counterparties.",
             }})
     return await call_next(request)
+
+
+# The biggest body any route here legitimately takes is a few kilobytes. The
+# per-field limits below are the real bounds; this one stops a 2 MB body before
+# anything parses it.
+MAX_BODY_BYTES = 64 * 1024
+
+
+@app.middleware("http")
+async def limit_body(request: Request, call_next):
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            too_big = int(declared) > MAX_BODY_BYTES
+        except ValueError:
+            too_big = True
+        if too_big:
+            return JSONResponse(status_code=413, content={"detail": {
+                "denied": f"request body over {MAX_BODY_BYTES} bytes"}})
+    return await call_next(request)
+
+
+@app.exception_handler(RequestValidationError)
+async def refuse_malformed(request: Request, exc: RequestValidationError) -> Response:
+    """422 without echoing the input back.
+
+    FastAPI's default reply quotes every offending value. That turned a 2 MB
+    context into a 2 MB response, and a lone surrogate into a 500, because the
+    echo could not be encoded. The caller already knows what it sent.
+    """
+    errors = [
+        {"loc": [str(part) for part in e.get("loc", ())],
+         "msg": str(e.get("msg", "")), "type": str(e.get("type", ""))}
+        for e in exc.errors()
+    ]
+    return Response(
+        content=json.dumps({"detail": errors}, ensure_ascii=True),
+        status_code=422, media_type="application/json",
+    )
+
+
+# --- the operator credential --------------------------------------------------
+#
+# The one secret the agent never holds. Approving a held payment, minting a root
+# mandate and publishing an agent card are all things a person does, and until
+# now none of them asked who was asking: an agent could escalate a payment and
+# approve it itself, or simply mint itself a fresh mandate with any budget.
+#
+# Read per request, not at import, so rotating it needs no restart. Unset means
+# refused, never open: a gateway that forgot to configure its operator must not
+# quietly let anyone be one.
+
+OPERATOR_HEADER = "x-operator-token"
+
+
+def require_operator(request: Request, *, tool: str, mandate_id: str = "operator",
+                     context: str = "") -> None:
+    expected = os.environ.get("POCKETCHANGE_OPERATOR_TOKEN", "").strip()
+    offered = (request.headers.get(OPERATOR_HEADER) or "").strip()
+    if not expected:
+        reason, status = "no operator credential is configured on this gateway", 503
+    elif not offered:
+        reason, status = "operator credential required", 401
+    elif not compare_digest(offered.encode(), expected.encode()):
+        reason, status = "operator credential does not match", 401
+    else:
+        return
+    entry = state.audit.append(
+        mandate_id=mandate_id, actor="unknown", tool=tool,
+        decision=Decision.DENIED, reason=reason, context=context[:200],
+    )
+    raise HTTPException(status, {"denied": reason, "audit_seq": entry.seq,
+                                 "hint": "send X-Operator-Token"})
+
+
+def local_operator_headers() -> dict[str, str]:
+    """For in-process demos and evals that play the operator themselves.
+
+    Uses the configured token, or sets a random one for this process only. Never
+    reachable over HTTP: a script holding the gateway object already holds the
+    root key, so this grants it nothing it did not have.
+    """
+    import secrets
+
+    token = os.environ.get("POCKETCHANGE_OPERATOR_TOKEN", "").strip()
+    if not token:
+        token = secrets.token_urlsafe(24)
+        os.environ["POCKETCHANGE_OPERATOR_TOKEN"] = token
+    return {"X-Operator-Token": token}
 
 
 def rate_limit_runs() -> None:
@@ -299,19 +401,71 @@ def rate_limit_runs() -> None:
 # --- request and response shapes -------------------------------------------
 
 
+# --- bounds on everything a caller can send -----------------------------------
+#
+# Money is a strict integer here. Lax parsing turned `true` into one paisa and
+# "100" into a hundred, and a value past i64 reached Biscuit and came back as a
+# 500. The ceiling is far above any real mandate and far below i64.
+MAX_PAISE = 1_000_000_000_000          # Rs 1,000 crore
+MAX_CONTEXT_CHARS = 2_000
+MAX_TOKEN_CHARS = 16_384
+MAX_IDENTITY_CHARS = 200
+MAX_TOOLS = 16
+MAX_TOOL_CHARS = 32
+MAX_CART_BYTES = 8_192
+MAX_CART_DEPTH = 4
+
+Paise = Annotated[StrictInt, Field(gt=0, le=MAX_PAISE)]
+PaiseOrZero = Annotated[StrictInt, Field(ge=0, le=MAX_PAISE)]
+Context = Annotated[str, Field(min_length=1, max_length=MAX_CONTEXT_CHARS)]
+ToolName = Annotated[str, Field(min_length=1, max_length=MAX_TOOL_CHARS)]
+TokenString = Annotated[str, Field(min_length=1, max_length=MAX_TOKEN_CHARS)]
+
+
+def _bounded_json(value: Any, *, what: str, max_bytes: int, max_depth: int) -> Any:
+    """Small, shallow, finite. Raises ValueError for pydantic to report.
+
+    A cart is fingerprinted, stored in the audit, sent to the monitor and to
+    the rail's notes, so its size is paid for four times over.
+    """
+    def walk(node: Any, depth: int) -> None:
+        if depth > max_depth:
+            raise ValueError(f"{what} nested deeper than {max_depth}")
+        if isinstance(node, float) and not math.isfinite(node):
+            raise ValueError(f"{what} holds a non-finite number")
+        if isinstance(node, dict):
+            for item in node.values():
+                walk(item, depth + 1)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+
+    walk(value, 1)
+    try:
+        size = len(canonical(value).encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{what} is not valid unicode") from exc
+    if size > max_bytes:
+        raise ValueError(f"{what} is {size} bytes, limit {max_bytes}")
+    return value
+
+
 class MandateRequest(BaseModel):
     # Unknown fields are rejected, not ignored. A request carrying a field
     # this gateway does not understand is a protocol mismatch, and silently
     # dropping it is how a caller ends up believing a constraint applied.
     model_config = ConfigDict(extra="forbid")
 
-    budget_paise: int = Field(gt=0, description="Ceiling for everything under this mandate")
+    budget_paise: Paise = Field(description="Ceiling for everything under this mandate")
     # 8, not 5: a recursive funnel needs room to decompose. Biscuit was probed
     # to depth 10 - the token grows ~324 base64 chars per layer, ~3KB at depth 8,
     # and verified at every level. That is well inside an 8KB header limit.
-    max_depth: int = Field(default=3, ge=1, le=8)
-    ttl_seconds: int = Field(default=3600, gt=0, le=86_400)
-    purpose: str = Field(min_length=1, description="What the human is authorising")
+    max_depth: StrictInt = Field(default=3, ge=1, le=8)
+    # Tied to the replay window: a token that outlived it could be charged twice.
+    ttl_seconds: StrictInt = Field(
+        default=3600, gt=0, le=int(MAX_MANDATE_LIFETIME.total_seconds()))
+    purpose: str = Field(min_length=1, max_length=1_000,
+                         description="What the human is authorising")
 
 
 class MandateResponse(BaseModel):
@@ -328,16 +482,16 @@ class DelegateRequest(BaseModel):
     # dropping it is how a caller ends up believing a constraint applied.
     model_config = ConfigDict(extra="forbid")
 
-    token: str
-    tools: list[str] = Field(min_length=1)
-    budget_paise: int = Field(ge=0)
-    context: str = Field(min_length=1, description="Why this delegation is happening")
-    to: str | None = None
-    depth: int | None = Field(
-        default=None, ge=0,
+    token: TokenString
+    tools: list[ToolName] = Field(min_length=1, max_length=MAX_TOOLS)
+    budget_paise: PaiseOrZero
+    context: Context = Field(description="Why this delegation is happening")
+    to: str | None = Field(default=None, min_length=1, max_length=MAX_IDENTITY_CHARS)
+    depth: StrictInt | None = Field(
+        default=None, ge=0, le=64,
         description="Ignored; depth is derived from the token chain, not claimed.",
     )
-    ttl_seconds: int | None = Field(
+    ttl_seconds: StrictInt | None = Field(
         default=None, gt=0, le=3600,
         description="Optional short life for the child, so an unused mandate expires.",
     )
@@ -349,21 +503,21 @@ class PayRequest(BaseModel):
     # dropping it is how a caller ends up believing a constraint applied.
     model_config = ConfigDict(extra="forbid")
 
-    amount_paise: int = Field(gt=0)
+    amount_paise: Paise
     cart: dict[str, Any] = Field(description="What is being bought; fingerprinted for replay")
-    context: str = Field(min_length=1, description="Why the agent believes it should pay")
-    depth: int | None = Field(
-        default=None, ge=0,
+    context: Context = Field(description="Why the agent believes it should pay")
+    depth: StrictInt | None = Field(
+        default=None, ge=0, le=64,
         description="Ignored; depth is derived from the token chain, not claimed.",
     )
-    aip_token: str | None = Field(default=None, description="A2A binding")
+    aip_token: TokenString | None = Field(default=None, description="A2A binding")
     # Reported by the buyer, so untrusted - but a signal worth keeping.
     # 0 means every parallel shopper produced an identical cart, which is the
     # monoculture failure D4 describes appearing inside our own system: same
     # model family, same catalogue, same answer. Unanimity is evidence, not
     # comfort. Recorded here so an independent observer can act on it later.
-    divergence: int | None = Field(
-        default=None, ge=0,
+    divergence: StrictInt | None = Field(
+        default=None, ge=0, le=64,
         description="How many distinct carts the parallel shoppers produced, minus one.",
     )
     # Who is being paid. Agent-supplied, so the NAME is untrusted - but what we
@@ -384,9 +538,15 @@ class PayRequest(BaseModel):
     # reachable effect is to demand more authorisation than the default path,
     # never less.
     repurchase: bool = Field(
-        default=False,
+        default=False, strict=True,
         description="Ask a person to authorise buying this same cart again.",
     )
+
+    @field_validator("cart")
+    @classmethod
+    def _cart_is_bounded(cls, cart: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json(cart, what="cart", max_bytes=MAX_CART_BYTES,
+                             max_depth=MAX_CART_DEPTH)
 
 
 class PayResponse(BaseModel):
@@ -396,6 +556,86 @@ class PayResponse(BaseModel):
     remaining_paise: int
     replayed: bool
     audit_seq: int
+
+
+# --- delegated budgets are cumulative ----------------------------------------
+#
+# Every delegation block carries `check if budget($b), $b <= N`. Biscuit checks
+# that against ONE payment, so a sub-payer capped at a seller's Rs 10 subtotal
+# could pay Rs 10, then Rs 10 again with a different cart, until the whole
+# mandate was gone. The cap read like a ceiling and behaved like a price limit.
+#
+# So each block that states a budget is also an envelope in the ledger, keyed by
+# that block's own revocation id and capped at its N. A payment holds against
+# the mandate AND every envelope above it, all or none. The figure is read from
+# the signed block itself, so nothing the caller sends can change it, and a block
+# whose budget the agent wrote offline still sits under every envelope the
+# gateway minted above it.
+
+_BUDGET_CHECK = re.compile(r"check if budget\(\$b\), \$b <= (\d+);")
+_HOLD_SEP = ","
+
+
+class DelegatedBudgetExhausted(InsufficientBudget):
+    """A delegated block's own cumulative cap, not the mandate's, ran out."""
+
+
+@dataclass(frozen=True)
+class Hold:
+    """Reservations against the mandate and each envelope, as one handle."""
+
+    id: str
+
+
+def _envelopes(bearer) -> list[tuple[str, int]]:
+    """(ledger id, cumulative cap) for every delegated block stating a budget."""
+    ids = bearer.revocation_ids
+    found = []
+    for index in range(1, bearer.block_count()):
+        caps = [int(n) for n in _BUDGET_CHECK.findall(bearer.block_source(index) or "")]
+        if caps:
+            found.append((f"envelope:{ids[index]}", min(caps)))
+    return found
+
+
+def _hold(mandate_id: str, envelopes: list[tuple[str, int]], amount: int, key: str) -> Hold:
+    """Reserve everywhere or nowhere. Exclusive, for the reason in pay()."""
+    held = [state.ledger.reserve(mandate_id, amount, key, exclusive=True).id]
+    try:
+        for envelope, cap in envelopes:
+            state.ledger.open(envelope, cap)
+            try:
+                held.append(state.ledger.reserve(
+                    envelope, amount, f"{key}@{envelope}", exclusive=True).id)
+            except InsufficientBudget as exc:
+                raise DelegatedBudgetExhausted(
+                    requested=exc.requested, available=exc.available, cap=exc.cap,
+                    committed=exc.committed, reserved=exc.reserved) from exc
+    except Exception:
+        _release(_HOLD_SEP.join(held))
+        raise
+    return Hold(_HOLD_SEP.join(held))
+
+
+def _release(hold_id: str):
+    """Give back every part of a hold. Returns the mandate's state."""
+    first = None
+    for part in hold_id.split(_HOLD_SEP):
+        try:
+            result = state.ledger.release(part)
+        except UnknownReservation:
+            continue
+        first = first or result
+    return first
+
+
+def _commit(hold_id: str):
+    """Turn every part of a hold into spend. Returns the mandate's state."""
+    parts = hold_id.split(_HOLD_SEP)
+    root = state.ledger.commit(parts[0])
+    for part in parts[1:]:
+        state.ledger.commit(part)
+    return root
 
 
 def _depth(bearer, claimed: int | None, *, mid: str, tool: str, context: str) -> int:
@@ -451,10 +691,10 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task: str = Field(min_length=1, max_length=400)
-    budget_paise: int = Field(gt=0, le=100_000_000)
+    budget_paise: StrictInt = Field(gt=0, le=100_000_000)
     max_depth: int = Field(default=8, ge=1, le=8)
     fan_out: int = Field(default=3, ge=2, le=6)
-    floor_paise: int = Field(default=5_000 * 100, gt=0)
+    floor_paise: StrictInt = Field(default=5_000 * 100, gt=0, le=100_000_000)
     decomposer: Literal["auto", "model", "departmental"] = Field(
         default="auto",
         description="auto uses the model when a key is configured, else departmental.",
@@ -592,6 +832,11 @@ class IntakeRequest(BaseModel):
 
     text: str = Field(min_length=1, max_length=1000)
     answers: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("answers")
+    @classmethod
+    def _answers_are_bounded(cls, answers: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json(answers, what="answers", max_bytes=8_192, max_depth=4)
     fan_out: int = Field(default=3, ge=2, le=6)
     max_depth: int = Field(default=8, ge=1, le=8)
     monitor: bool = True
@@ -788,7 +1033,8 @@ def _search_for(node) -> list[dict[str, Any]]:
         # the value is that the next payment to them carries this history.
         for supplier, url in websearch.suspicious(hits):
             try:
-                state.counterparties.flag(supplier or url, counterparties.INJECTION)
+                state.counterparties.flag(websearch.attributable(supplier, url),
+                                          counterparties.INJECTION)
             except Exception:  # noqa: BLE001
                 pass
         return [h.as_prompt_dict() for h in hits]
@@ -894,10 +1140,16 @@ class EventIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     node_id: str = Field(min_length=1, max_length=200)
-    parent_id: str | None = None
+    parent_id: str | None = Field(default=None, max_length=200)
     depth: int = Field(default=0, ge=0, le=32)
-    kind: str
+    kind: str = Field(max_length=40)
     detail: dict[str, Any] = Field(default_factory=dict)
+
+    # Not a record, but it is held in memory and replayed to every console.
+    @field_validator("detail")
+    @classmethod
+    def _detail_is_bounded(cls, detail: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json(detail, what="detail", max_bytes=8_192, max_depth=4)
 
 
 @app.post("/events")
@@ -978,12 +1230,16 @@ def healthz() -> dict[str, Any]:
 
 
 @app.post("/mandates", response_model=MandateResponse)
-def create_mandate(req: MandateRequest) -> MandateResponse:
+def create_mandate(request: Request, req: MandateRequest) -> MandateResponse:
     """A human authorises spending. Returns the root token.
 
     This is the only place a ceiling can be set, because nothing appended to
     this token later can loosen a check written here.
+
+    So it is the operator's, not the agent's. Open, it let a compromised agent
+    stop narrowing its own token and simply ask for a new root with any budget.
     """
+    require_operator(request, tool="mandate", context=req.purpose)
     expires = datetime.now(timezone.utc) + timedelta(seconds=req.ttl_seconds)
     root = token.mint(
         state.principal,
@@ -1023,7 +1279,26 @@ def delegate(req: DelegateRequest) -> dict[str, Any]:
     design work across trust boundaries - no issuer round-trip to get less
     authority.
     """
-    parent = token.deserialize(req.token, state.root_public_key)
+    try:
+        parent = token.deserialize(req.token, state.root_public_key)
+    except token.Forged as exc:
+        # Same treatment /pay gives a forgery: refused and written down. This
+        # used to escape as a 500 with nothing in the audit, which is the one
+        # outcome a fail-closed gateway is not allowed to have.
+        entry = state.audit.append(
+            mandate_id="unknown", actor="unknown", tool="delegate",
+            decision=Decision.DENIED, reason=f"forged token: {exc}"[:300],
+            context=req.context, detail={"requested_tools": req.tools},
+        )
+        raise HTTPException(
+            401, {"denied": "forged token", "audit_seq": entry.seq}) from exc
+
+    if not req.context.strip():
+        entry = state.audit.append(
+            mandate_id=token.mandate_id(parent), actor="unknown", tool="delegate",
+            decision=Decision.DENIED, reason="empty context", context=req.context,
+        )
+        raise HTTPException(400, {"denied": "empty context", "audit_seq": entry.seq})
 
     # Delegation is itself a capability. Without this check any token holder can
     # mint children, so a shopper could mint itself a payer and the whole sibling
@@ -1058,6 +1333,29 @@ def delegate(req: DelegateRequest) -> dict[str, Any]:
         raise HTTPException(
             403, {"denied": "token may not delegate", "audit_seq": entry.seq}
         ) from exc
+
+    # A child may not be minted wider than its parent. It could never USE the
+    # extra - every parent check still applies at /pay - but it was minted and
+    # audited as "delegated payout, Rs 1 crore", and an audit trail that records
+    # authority nobody had is a false record. Asked of the parent chain at the
+    # child's depth, for the budget and for every tool requested.
+    child_depth = parent_depth + 1
+    for tool_name in dict.fromkeys(req.tools):
+        try:
+            token.verify(parent, Operation(tool_name, req.budget_paise, depth=child_depth))
+        except token.Denied as exc:
+            entry = state.audit.append(
+                mandate_id=token.mandate_id(parent), actor=req.to or "unknown",
+                tool="delegate", decision=Decision.DENIED,
+                reason=f"a child cannot hold {tool_name} at {req.budget_paise}p: "
+                       f"the parent chain does not",
+                context=req.context, amount_paise=req.budget_paise,
+                detail={"requested_tools": req.tools},
+            )
+            raise HTTPException(403, {
+                "denied": f"cannot delegate more than the parent holds ({tool_name})",
+                "audit_seq": entry.seq,
+            }) from exc
 
     expires = None
     if req.ttl_seconds:
@@ -1138,7 +1436,11 @@ def pay(
             amount_paise=req.amount_paise,
             detail=detail or {},
         )
-        _flag(req.counterparty, counterparties.REFUSED)
+        # Only a caller holding a genuine token gets to put a name in our
+        # record. A forged token used to flag whoever it named as "refused",
+        # so anyone on the network could smear a supplier for free.
+        if mid != "unknown":
+            _flag(req.counterparty, counterparties.REFUSED)
         return HTTPException(status, {"denied": reason, "audit_seq": entry.seq})
 
     # 2. authenticate
@@ -1180,6 +1482,7 @@ def pay(
     # was handed the first receipt and the price change vanished silently. The
     # replay branch below never compared amounts, so nothing else would have
     # caught it.
+    envelopes = _envelopes(bearer)
     idem = derive_key(mandate_id=mid, tool="pay",
                       payload={"cart": req.cart, "amount_paise": req.amount_paise})
     prior = state.replays.get(idem)
@@ -1197,6 +1500,7 @@ def pay(
         if req.repurchase:
             return _open_repurchase(
                 mid=mid, actor=actor, base_key=idem, req=req, deny=deny,
+                envelopes=envelopes,
             )
         state.audit.append(
             mandate_id=mid, actor=actor, tool="pay", decision=Decision.ALLOWED,
@@ -1206,10 +1510,14 @@ def pay(
         return PayResponse(**{**prior.result, "replayed": True})
 
     try:
-        reservation = state.ledger.reserve(mid, req.amount_paise, idem)
+        # Exclusive: if an identical payment already holds this key - waiting on
+        # a person, or simply still in flight - this one is refused rather than
+        # handed the same hold. Sharing it let both reach the rail.
+        reservation = _hold(mid, envelopes, req.amount_paise, idem)
     except InsufficientBudget as exc:
         raise deny(
-            "cumulative budget exhausted",
+            "delegated budget exhausted" if isinstance(exc, DelegatedBudgetExhausted)
+            else "cumulative budget exhausted",
             402,
             {"requested": exc.requested, "available": exc.available,
              "cap": exc.cap, "committed": exc.committed},
@@ -1278,8 +1586,8 @@ def pay(
         suggested = judgement.suggested_amount_paise
         if suggested and 0 < suggested < req.amount_paise:
             try:
-                state.ledger.release(reservation.id)
-                reservation = state.ledger.reserve(mid, suggested, idem)
+                _release(reservation.id)
+                reservation = _hold(mid, envelopes, suggested, idem)
             except LedgerError as exc:
                 raise deny(f"could not reduce to the suggested amount: {exc}", 409) from exc
             deferred_from, settle_amount = req.amount_paise, suggested
@@ -1343,7 +1651,8 @@ def pay(
     ))
 
 
-def _open_repurchase(*, mid: str, actor: str, base_key: str, req, deny) -> None:
+def _open_repurchase(*, mid: str, actor: str, base_key: str, req, deny,
+                     envelopes: list[tuple[str, int]]) -> None:
     """Ask a person to authorise buying the same cart a second time.
 
     Always raises - either 202 with an approval to answer, or a denial. There is
@@ -1364,10 +1673,11 @@ def _open_repurchase(*, mid: str, actor: str, base_key: str, req, deny) -> None:
     # like any other. A mandate with nothing left cannot buy the same thing
     # twice just because it once could.
     try:
-        reservation = state.ledger.reserve(mid, req.amount_paise, key)
+        reservation = _hold(mid, envelopes, req.amount_paise, key)
     except InsufficientBudget as exc:
         raise deny(
-            "cumulative budget exhausted",
+            "delegated budget exhausted" if isinstance(exc, DelegatedBudgetExhausted)
+            else "cumulative budget exhausted",
             402,
             {"requested": exc.requested, "available": exc.available,
              "cap": exc.cap, "committed": exc.committed},
@@ -1419,7 +1729,7 @@ def _settle(
     except PaymentError as exc:
         # The charge never happened, so the budget goes back and the idempotency
         # key is released, keeping the action retryable.
-        state.ledger.release(reservation_id)
+        _release(reservation_id)
         state.replays.forget(idempotency_key)
         entry = state.audit.append(
             mandate_id=mandate_id, actor="gateway", tool="pay",
@@ -1430,7 +1740,7 @@ def _settle(
             502, {"denied": f"payment rail failed: {exc}", "audit_seq": entry.seq}
         ) from exc
 
-    ledger_state = state.ledger.commit(reservation_id)
+    ledger_state = _commit(reservation_id)
 
     # Recorded only for money that actually cleared. A reservation that was
     # released, or a payment the rail refused, is not a dealing with anybody.
@@ -1464,14 +1774,14 @@ class PayoutRequest(BaseModel):
     # dropping it is how a caller ends up believing a constraint applied.
     model_config = ConfigDict(extra="forbid")
 
-    account: str = Field(min_length=1)
-    amount_paise: int = Field(gt=0)
-    context: str = Field(min_length=1)
-    depth: int | None = Field(
-        default=None, ge=0,
+    account: str = Field(min_length=1, max_length=MAX_IDENTITY_CHARS)
+    amount_paise: Paise
+    context: Context
+    depth: StrictInt | None = Field(
+        default=None, ge=0, le=64,
         description="Ignored; depth is derived from the token chain, not claimed.",
     )
-    aip_token: str | None = None
+    aip_token: TokenString | None = None
 
 
 @app.post("/payout")
@@ -1527,8 +1837,8 @@ class ApprovalDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     decision: str = Field(pattern="^(approve|deny)$")
-    by: str = Field(default="human", min_length=1)
-    note: str = Field(default="")
+    by: str = Field(default="human", min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
 
 
 def _sweep_expired() -> None:
@@ -1548,7 +1858,7 @@ def _sweep_expired() -> None:
             )
             continue
         try:
-            state.ledger.release(approval.reservation_id)
+            _release(approval.reservation_id)
         except LedgerError:
             pass
         state.replays.forget(approval.idempotency_key)
@@ -1569,8 +1879,21 @@ def list_approvals() -> dict[str, Any]:
 
 
 @app.post("/approvals/{approval_id}")
-def decide_approval(approval_id: str, req: ApprovalDecision) -> dict[str, Any]:
-    """A human answers. Approving resumes the payment from where it stopped."""
+def decide_approval(request: Request, approval_id: str,
+                    req: ApprovalDecision) -> dict[str, Any]:
+    """A human answers. Approving resumes the payment from where it stopped.
+
+    "A human" used to be anyone who could reach this URL, which included the
+    agent whose payment was held: escalate, then approve yourself. The operator
+    credential is checked before the approval is even looked up, so an
+    unauthenticated caller cannot tell a real approval id from a made-up one.
+    """
+    try:
+        held_for = state.approvals.get(approval_id).mandate_id
+    except UnknownApproval:
+        held_for = "unknown"
+    require_operator(request, tool="approve", mandate_id=held_for,
+                     context=f"{req.decision} {approval_id}")
     _sweep_expired()
     try:
         approval = state.approvals.get(approval_id)
@@ -1604,7 +1927,7 @@ def decide_approval(approval_id: str, req: ApprovalDecision) -> dict[str, Any]:
         }
 
     if not approved:
-        state.ledger.release(approval.reservation_id)
+        _release(approval.reservation_id)
         state.replays.forget(approval.idempotency_key)
         entry = state.audit.append(
             mandate_id=approval.mandate_id, actor=req.by, tool="pay",
@@ -1637,15 +1960,15 @@ def decide_approval(approval_id: str, req: ApprovalDecision) -> dict[str, Any]:
 class PublishRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1)
-    version: str = Field(min_length=1)
-    department: str = Field(min_length=1)
-    owner: str = Field(min_length=1)
-    identity: str = Field(min_length=1)
-    capabilities: list[str] = Field(min_length=1)
-    max_budget_paise: int = Field(ge=0)
-    model: str = ""
-    description: str = ""
+    name: str = Field(min_length=1, max_length=100)
+    version: str = Field(min_length=1, max_length=40)
+    department: str = Field(min_length=1, max_length=100)
+    owner: str = Field(min_length=1, max_length=100)
+    identity: str = Field(min_length=1, max_length=MAX_IDENTITY_CHARS)
+    capabilities: list[ToolName] = Field(min_length=1, max_length=MAX_TOOLS)
+    max_budget_paise: PaiseOrZero
+    model: str = Field(default="", max_length=100)
+    description: str = Field(default="", max_length=1_000)
 
 
 @app.get("/agents")
@@ -1667,13 +1990,17 @@ def get_agent(name: str, version: str | None = None) -> dict[str, Any]:
 
 
 @app.post("/agents")
-def publish_agent(req: PublishRequest) -> dict[str, Any]:
+def publish_agent(request: Request, req: PublishRequest) -> dict[str, Any]:
     """Publish a version. Re-publishing an existing one is refused.
 
     An agent whose prompt or capabilities changed is a different agent;
     overwriting in place would leave the audit trail unable to say which one
     spent the money.
+
+    Cards are published approved, so publishing is the operator's act. Open,
+    anyone could put an approved card in the catalogue.
     """
+    require_operator(request, tool="registry", context=f"publish {req.name}@{req.version}")
     try:
         card = state.registry.publish(AgentCard(
             name=req.name, version=req.version, department=req.department,
@@ -1690,10 +2017,10 @@ def publish_agent(req: PublishRequest) -> dict[str, Any]:
 class StandingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    instruction: str = Field(min_length=1)
-    department: str = Field(min_length=1)
+    instruction: str = Field(min_length=1, max_length=1_000)
+    department: str = Field(min_length=1, max_length=100)
     period: str = Field(default="month", pattern="^(week|month|quarter)$")
-    budget_paise: int = Field(gt=0)
+    budget_paise: Paise
 
 
 @app.post("/standing")

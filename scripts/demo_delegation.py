@@ -50,7 +50,7 @@ def main() -> int:
     # offline with no credentials.
     gateway.state.rail = FakeRail()
     gateway.state.monitor = ScriptedMonitor(Verdict.ALLOW, "pinned for L1b")
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     mandate = client.post("/mandates", json={
         "budget_paise": 600_000 * RUPEE,

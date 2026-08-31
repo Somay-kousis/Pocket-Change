@@ -143,6 +143,15 @@ else
   put_secret pc-demo-token "$DEMO_TOKEN"
 fi
 
+# The operator token releases held payments, mints mandates and publishes agent
+# cards. Unlike the demo token it is never built into the console: whoever
+# decides approvals pastes it into their own browser. Generated once and reused.
+if gcloud secrets describe pc-operator-token --project="$PROJECT" >/dev/null 2>&1; then
+  step "reuse  pc-operator-token"
+else
+  put_secret pc-operator-token "$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 40)"
+fi
+
 # --- registry ---------------------------------------------------------------
 
 say "4/6  Artifact Registry"
@@ -187,7 +196,7 @@ gcloud run deploy "$SERVICE" \
   --no-cpu-throttling \
   --timeout=600 \
   --set-env-vars="GOOGLE_CLOUD_PROJECT=$PROJECT,POCKETCHANGE_NO_DOTENV=1,POCKETCHANGE_EPHEMERAL_KEYS=1,POCKETCHANGE_VERTEX_LOCATION=$REGION,POCKETCHANGE_VERTEX_JUDGE_MODEL=$JUDGE_MODEL" \
-  --set-secrets="RAZORPAY_KEY_ID=pc-razorpay-key-id:latest,RAZORPAY_KEY_SECRET=pc-razorpay-key-secret:latest,GEMINI_API_KEY=pc-gemini-api-key:latest,TAVILY_API_KEY=pc-tavily-api-key:latest,GROQ_API_KEY=pc-groq-api-key:latest,OPENROUTER_API_KEY=pc-openrouter-api-key:latest,CEREBRAS_API_KEY=pc-cerebras-api-key:latest,SAMBANOVA_API_KEY=pc-sambanova-api-key:latest,POCKETCHANGE_DEMO_TOKEN=pc-demo-token:latest" \
+  --set-secrets="RAZORPAY_KEY_ID=pc-razorpay-key-id:latest,RAZORPAY_KEY_SECRET=pc-razorpay-key-secret:latest,GEMINI_API_KEY=pc-gemini-api-key:latest,TAVILY_API_KEY=pc-tavily-api-key:latest,GROQ_API_KEY=pc-groq-api-key:latest,OPENROUTER_API_KEY=pc-openrouter-api-key:latest,CEREBRAS_API_KEY=pc-cerebras-api-key:latest,SAMBANOVA_API_KEY=pc-sambanova-api-key:latest,POCKETCHANGE_DEMO_TOKEN=pc-demo-token:latest,POCKETCHANGE_OPERATOR_TOKEN=pc-operator-token:latest" \
   --quiet
 
 URL="$(gcloud run services describe "$SERVICE" --project="$PROJECT" --region="$REGION" --format='value(status.url)')"
@@ -197,6 +206,7 @@ say "Live"
 step "console   $URL"
 step "health    $URL/status"
 step "demo token (needed to start a run):  $DEMO_TOKEN"
+step "operator token (approvals, mandates): gcloud secrets versions access latest --secret=pc-operator-token --project=$PROJECT"
 echo
 step "Reads are open. Starting a run needs that token, which the console"
 step "already carries — it is a brake on quota, not authentication."

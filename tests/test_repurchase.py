@@ -19,6 +19,8 @@ failure being guarded against is precisely a clean record over a wrong transfer.
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from pocketchange import gateway
 from pocketchange.audit import Decision
 from pocketchange.policy import RUPEE
@@ -31,7 +33,7 @@ def client(monkeypatch):
     monkeypatch.delenv("RAZORPAY_KEY_ID", raising=False)
     monkeypatch.delenv("RAZORPAY_KEY_SECRET", raising=False)
     gateway.state = gateway.State()
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 @pytest.fixture

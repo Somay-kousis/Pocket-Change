@@ -6,7 +6,7 @@
 
 **You hand an agent pocket change, not your wallet.**
 
-[![tests](https://img.shields.io/badge/tests-378_passing-2f6b45)](#verify-every-claim-on-this-page)
+[![tests](https://img.shields.io/badge/tests-831_passing-2f6b45)](#verify-every-claim-on-this-page)
 [![offline](https://img.shields.io/badge/offline-no_credentials_needed-4a5a51)](#60-second-start)
 [![enforcement](https://img.shields.io/badge/enforcement-0.18_ms-2f6b45)](#what-it-costs)
 [![SoK](https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45)](#the-threat-model)
@@ -60,12 +60,17 @@ No credentials, no network, no quota. Everything below runs on a clean clone.
 ```bash
 python3.12 -m venv .venv && .venv/bin/pip install -e ".[biscuit,gcp,agent,trace,dev]"
 
-.venv/bin/pytest                              # 399 tests, ~6s
+.venv/bin/pytest                              # 831 tests, ~20s
 .venv/bin/python scripts/demo_funnel.py       # 148 agents, 81 payments, one ceiling
 .venv/bin/python scripts/demo_injection.py    # a fully compromised agent, refused
 .venv/bin/python scripts/demo_trust.py        # the seller's reputation vs ours
 .venv/bin/python -m eval.funnel               # every bound, firing
 ```
+
+Approving a held payment, minting a mandate and publishing an agent card need
+`POCKETCHANGE_OPERATOR_TOKEN` set on the gateway and sent as `X-Operator-Token`.
+The CLI reads it from the environment; the console asks for it once. Unset, those
+routes refuse. The demos and tests set their own.
 
 **If you run one thing, run `demo_funnel.py`.** It decomposes a ₹6,00,000
 procurement task into 148 agents across 5 layers, pays 81 of them, and proves
@@ -456,6 +461,62 @@ trading agents would be a scoreboard drawn by the people being scored.**
 
 ---
 
+## Attacked, then fixed
+
+`tests/attacks/` is a corpus where every case tries to get money or authority the
+caller was never given, and passes only when the attempt fails. Each case checks
+the money, not just the status code: no new rail order, committed spend
+unchanged, and the denial in the audit with the chain intact. Three attackers: a
+compromised agent holding a real token, a hostile seller, and someone with only
+network access. `test_register.py` pins the count so it cannot drift.
+
+It is **400 attacks, 394 blocked, 6 known limits**, run as `pytest tests/attacks`.
+The 6 are deliberate limitations this README already states, marked
+`xfail(strict=True)` with the reason, so the day one is closed the suite says so.
+`test_register.py` fails if the count drifts from 400 or if two cases differ only
+by a number.
+
+Writing it found these. Every one is fixed and has a test.
+
+- **An agent could approve its own held payment.** `POST /approvals/{id}` never
+  asked who was approving. It now needs `X-Operator-Token`, a credential the
+  agent never holds, and refuses outright when none is configured.
+- **An agent could mint itself a new mandate.** `POST /mandates` was open, so a
+  capped agent could just ask for a fresh root with any budget. Operator only now.
+  So is `POST /agents`, which published approved cards for anyone.
+- **Sub-mandate caps were per payment, not cumulative.** A sub-payer capped at a
+  seller's Rs 10 paid Rs 10 five times. Every delegated budget is now its own
+  envelope in the ledger, and a payment holds against all of them or none.
+- **Double charge after the replay window.** Replay records lived 1 hour, mandates
+  up to 24. The same cart after the window hit the rail twice and the ledger
+  counted once. The window now covers the longest mandate, and the ledger refuses
+  to hand back a reservation that already settled.
+- **Double charge while a payment was held.** Paying the same cart again while the
+  first waited on a person reused the held reservation. Approving the first then
+  charged the rail a second time. A second hold on the same key is now refused.
+- **A forged token could smear a supplier.** A failed `/pay` with a garbage token
+  still flagged the named counterparty as refused. Only authenticated requests
+  write to the record now.
+- **A page could get a competitor flagged.** Search flagged whatever supplier a
+  hostile page claimed to be. The claim now counts only when the page is served
+  from that supplier's own host.
+- **Datamarking had holes.** One marker character anywhere in a description
+  skipped marking for the whole text, and zero-width or Unicode tag characters
+  slipped words past it. Seller names from `seller_reputation` were not marked at
+  all. All fixed.
+- **Children wider than their parent were minted.** They could never spend the
+  extra, but the audit recorded authority nobody had. `/delegate` now refuses.
+- **Money fields were lax.** `true` paid one paisa, `"100"` paid a hundred, and
+  anything past i64 was a 500. Strict integers with a ceiling now.
+- **No length limits.** A 2 MB context was accepted. Every field and cart is
+  bounded, and a body over 64 KB is refused before parsing.
+- **Crashes with no audit entry.** A forged token or a blank context on
+  `/delegate`, a lone surrogate anywhere, or a non-ASCII demo token header
+  returned 500. Each is now a refusal, recorded where the gateway saw it. A 422
+  also no longer echoes the input back.
+
+---
+
 ## The stack, and why each piece is here
 
 Nothing in this list is decoration. Each entry states the job it does and what
@@ -500,7 +561,7 @@ deploy/           Cloud Run: one script, one service, one URL
 merchant/         a simulated world, including 4 adversarial pages
 frontend/         the console — five panes, live SSE
 eval/             funnel · monitor · vectors · latency
-tests/            378, all offline
+tests/            831, all offline (400 of them attacks)
 ```
 
 ### Files you can ignore
@@ -538,6 +599,9 @@ Stated here rather than discovered later — the same move AIP §7 makes.
 - **The root key is a file on disk**, and on Cloud Run it is generated per
   instance and lost on restart — a silent revocation of every live mandate. It
   belongs in a KMS.
+- **The operator token is one shared secret.** It guards approvals, mandates and
+  agent cards, and whoever holds it is the operator. There is no per-person login
+  behind it yet.
 - **The demo gate is not authentication.** One shared token, shipped in a public
   page. It stops a crawler draining the free tier; it stops nothing else.
 
@@ -572,7 +636,8 @@ the real one. It caught its own drift on the first run.
 ## Verify every claim on this page
 
 ```bash
-.venv/bin/pytest                       # 399 tests
+.venv/bin/pytest                       # 831 tests
+.venv/bin/pytest tests/attacks         # 400 attacks, 394 blocked
 .venv/bin/python -m eval.funnel        # the tree, and every bound firing
 .venv/bin/python -m eval.vectors       # 10/12, with reasons for the 2
 .venv/bin/python -m eval.latency       # the two layers, timed

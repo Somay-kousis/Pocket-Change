@@ -70,7 +70,7 @@ def main():
     # Pinned so this runs without quota. The monitor is exercised by
     # demo_injection and by its own tests; the subject here is the funnel.
     gateway.state.monitor = ScriptedMonitor(verdict=Verdict.ALLOW)
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     heading("THE MANDATE")
     r = client.post("/mandates", json={

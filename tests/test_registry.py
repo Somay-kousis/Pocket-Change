@@ -12,6 +12,8 @@ having both.
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from pocketchange import gateway
 from pocketchange.policy import RUPEE
 from pocketchange.registry import AgentCard, AgentRegistry, ExceedsCard, UnknownAgent
@@ -31,7 +33,7 @@ def registry():
 @pytest.fixture
 def client():
     gateway.state = gateway.State()
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 # --- publishing and versioning ---------------------------------------------

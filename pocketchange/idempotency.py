@@ -38,7 +38,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-DEFAULT_TTL = timedelta(hours=1)
+# The longest any mandate may live. /mandates refuses a longer ttl, and every
+# delegated child is bounded by its parent's expiry, so no token outlives this.
+MAX_MANDATE_LIFETIME = timedelta(hours=24)
+
+# Must cover the longest-lived token, not a convenient hour. It was one hour
+# while mandates lived up to 24, and the gap was a double charge: the same cart
+# sent again after the window found no replay record, reached the rail a second
+# time, and only then hit the settled reservation in the ledger and returned 500.
+# The margin absorbs clock skew between minting and the check.
+DEFAULT_TTL = MAX_MANDATE_LIFETIME + timedelta(minutes=5)
 
 
 def canonical(payload: Any) -> str:

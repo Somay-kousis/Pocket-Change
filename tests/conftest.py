@@ -13,10 +13,18 @@ import os
 
 import pytest
 
+from tests._operator import OPERATOR_TOKEN
+
 
 @pytest.fixture(autouse=True)
 def ephemeral_keys(monkeypatch):
     monkeypatch.setenv("POCKETCHANGE_EPHEMERAL_KEYS", "1")
+
+
+@pytest.fixture(autouse=True)
+def operator_credential(monkeypatch):
+    """The gateway refuses operator routes when this is unset, so set it."""
+    monkeypatch.setenv("POCKETCHANGE_OPERATOR_TOKEN", OPERATOR_TOKEN)
 
 
 @pytest.fixture(autouse=True, scope="session")

@@ -12,6 +12,8 @@ import re
 import pytest
 from fastapi.testclient import TestClient
 
+from tests._operator import OPERATOR_HEADERS
+
 from pocketchange import funnel, gateway
 from pocketchange.monitor import Verdict
 
@@ -23,7 +25,7 @@ INDEX = ROOT / "frontend" / "index.html"
 def client(monkeypatch):
     monkeypatch.delenv("RAZORPAY_KEY_ID", raising=False)
     gateway.state = gateway.State()
-    return TestClient(gateway.app)
+    return TestClient(gateway.app, headers=OPERATOR_HEADERS)
 
 
 def test_facts_derives_the_bound_count_rather_than_stating_it():

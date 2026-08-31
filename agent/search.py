@@ -181,6 +181,27 @@ def suspicious(results: list["Result"]) -> list[tuple[str, str]]:
     ]
 
 
+def attributable(supplier: str, url: str) -> str:
+    """Who a suspicious page may be held against.
+
+    The supplier a page names is the page's own claim. Flagging it as written
+    let any site put a competitor's name on an injection and have us record the
+    competitor as the injector. So the claimed name counts only when the page
+    is served from that supplier's own host; otherwise the record goes against
+    the URL, which is the one thing about the page we observed ourselves.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    name = (supplier or "").strip().lower()
+    # The whole host minus its top-level label, nothing looser: a subdomain
+    # like meridian-systems.evil.example is the attacker's, not Meridian's.
+    # Hosts under two-part suffixes fall back to the URL, the safe direction.
+    if name and "." in host and host.rsplit(".", 1)[0] == name:
+        return supplier.strip()
+    return url
+
+
 def brief(results: list[Result]) -> str:
     """A prompt-ready summary. Carries the spotlighting instruction with it, so
     no caller can include the data and forget the warning."""

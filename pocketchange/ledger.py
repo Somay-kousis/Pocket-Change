@@ -60,6 +60,23 @@ class UnknownReservation(LedgerError):
     """No reservation under this id, or it was already settled."""
 
 
+class AlreadySettled(LedgerError):
+    """This idempotency key was already charged. Refused, never handed back.
+
+    Handing back the settled reservation is what made a late duplicate cost
+    money: the caller took it as a fresh hold, charged the rail, and only then
+    failed to commit something already committed. Two orders, one ledger line.
+    """
+
+
+class InFlight(LedgerError):
+    """An identical payment holds this key and has not settled yet.
+
+    Raised only when the caller asks for an exclusive hold. Sharing one open
+    reservation between two requests lets both reach the rail.
+    """
+
+
 @dataclass(frozen=True)
 class Reservation:
     """A hold placed on part of a mandate's budget, not yet charged."""
@@ -95,7 +112,8 @@ class Ledger(Protocol):
     """
 
     def open(self, mandate_id: str, cap_paise: int) -> LedgerState: ...
-    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str) -> Reservation: ...
+    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str,
+                *, exclusive: bool = False) -> Reservation: ...
     def commit(self, reservation_id: str) -> LedgerState: ...
     def release(self, reservation_id: str) -> LedgerState: ...
     def state(self, mandate_id: str) -> LedgerState: ...
@@ -146,7 +164,8 @@ class MemoryLedger:
                 self._mandates[mandate_id] = _Mandate(cap_paise=cap_paise)
             return self._state(mandate_id)
 
-    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str) -> Reservation:
+    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str,
+                *, exclusive: bool = False) -> Reservation:
         """Hold budget against the cap, or refuse.
 
         Idempotent on the key. A repeat of the same request returns the original
@@ -154,6 +173,12 @@ class MemoryLedger:
         replay from being charged twice. The check lives here, in the same lock
         that guards the budget, because splitting them reintroduces the race
         this method exists to close.
+
+        Two limits on that. A key that already SETTLED is refused with
+        AlreadySettled: returning it let a late duplicate charge the rail again.
+        And with `exclusive`, an open hold is refused with InFlight rather than
+        shared, because the gateway charges whatever reservation it is given and
+        two requests holding the same one both reach the rail.
         """
         if amount_paise <= 0:
             raise ValueError(f"reservation must be positive, got {amount_paise}")
@@ -164,7 +189,14 @@ class MemoryLedger:
             prior_id = self._by_idem.get(idempotency_key)
             if prior_id is not None:
                 mandate = self._mandates[self._by_reservation[prior_id]]
-                return mandate.reservations[prior_id]
+                prior = mandate.reservations[prior_id]
+                if prior.settled:
+                    raise AlreadySettled(
+                        f"key {idempotency_key[:12]} was already charged")
+                if exclusive:
+                    raise InFlight(
+                        f"an identical payment holds key {idempotency_key[:12]}")
+                return prior
 
             mandate = self._mandates.get(mandate_id)
             if mandate is None:
@@ -296,7 +328,8 @@ class FirestoreLedger:
             ref.set({"cap_paise": cap_paise, "committed_paise": 0, "reserved_paise": 0})
         return self.state(mandate_id)
 
-    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str) -> Reservation:
+    def reserve(self, mandate_id: str, amount_paise: int, idempotency_key: str,
+                *, exclusive: bool = False) -> Reservation:
         if amount_paise <= 0:
             raise ValueError(f"reservation must be positive, got {amount_paise}")
         if not idempotency_key.strip():
@@ -318,6 +351,13 @@ class FirestoreLedger:
                     .document(prior.to_dict()["reservation_id"])
                     .get(transaction=transaction)
                 )
+                # Same two refusals as MemoryLedger.reserve, for the same reasons.
+                if (held.to_dict() or {}).get("settled"):
+                    raise AlreadySettled(
+                        f"key {idempotency_key[:12]} was already charged")
+                if exclusive:
+                    raise InFlight(
+                        f"an identical payment holds key {idempotency_key[:12]}")
                 return held.id, held.to_dict()
 
             snapshot = mandate_ref.get(transaction=transaction)

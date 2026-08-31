@@ -44,7 +44,7 @@ def main() -> int:
     gateway.state.counterparties = InMemoryCounterparties()
     seen = ScriptedMonitor(verdict=Verdict.ALLOW)
     gateway.state.monitor = seen
-    client = TestClient(gateway.app)
+    client = TestClient(gateway.app, headers=gateway.local_operator_headers())
 
     mandate = client.post("/mandates", json={
         "budget_paise": 500_000 * RUPEE, "purpose": "restock the office",
