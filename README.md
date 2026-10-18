@@ -6,11 +6,19 @@
 
 **You hand an agent pocket change, not your wallet.**
 
-[![tests](https://img.shields.io/badge/tests-831_passing-2f6b45)](#verify-every-claim-on-this-page)
-[![offline](https://img.shields.io/badge/offline-no_credentials_needed-4a5a51)](#60-second-start)
-[![enforcement](https://img.shields.io/badge/enforcement-0.18_ms-2f6b45)](#what-it-costs)
-[![SoK](https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45)](#the-threat-model)
-[![licence](https://img.shields.io/badge/licence-Apache--2.0-4a5a51)](#licence)
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12--3.13-3776AB.svg" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-gateway-009688.svg" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/Google%20ADK-agents-4285F4.svg" alt="Google ADK" />
+  <img src="https://img.shields.io/badge/Gemini-LLM-8E75B2.svg" alt="Gemini" />
+  <img src="https://img.shields.io/badge/Firestore-ledger-FFCA28.svg" alt="Firestore" />
+  <img src="https://img.shields.io/badge/Razorpay-test%20mode-3395FF.svg" alt="Razorpay" />
+  <a href="#verify-every-claim-on-this-page"><img src="https://img.shields.io/badge/tests-831_passing-2f6b45" alt="tests" /></a>
+  <a href="#60-second-start"><img src="https://img.shields.io/badge/offline-no_credentials_needed-4a5a51" alt="offline" /></a>
+  <a href="#what-it-costs"><img src="https://img.shields.io/badge/enforcement-0.18_ms-2f6b45" alt="enforcement" /></a>
+  <a href="#the-threat-model"><img src="https://img.shields.io/badge/SoK_vectors-10%2F12_defended-2f6b45" alt="SoK" /></a>
+  <a href="#licence"><img src="https://img.shields.io/badge/licence-Apache--2.0-4a5a51" alt="licence" /></a>
+</p>
 
 ### **[▶ Live demo](https://pocket-change-590042703212.asia-south1.run.app)**
 
